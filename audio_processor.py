@@ -8,16 +8,15 @@ import os
 import subprocess
 import threading
 import time
+import tempfile
 from pathlib import Path
 from typing import Optional
-from queue import Queue
+import sys
 
 try:
     from pydub import AudioSegment
-    from pydub.playback import play
 except ImportError:
     AudioSegment = None
-    play = None
 
 
 class AudioProcessor:
@@ -40,31 +39,29 @@ class AudioProcessor:
         
         self.video_path = video_path
         self.audio_data = None
-        self.audio_file = None
+        self.audio_file_path = None
         self.is_playing = False
         self.play_thread = None
+        self.playback_process = None
         self.playback_start_time = None
         self.audio_duration = 0
+        self._temp_audio_file = None
         
-    def extract_audio(self, output_format: str = "mp3") -> Optional[AudioSegment]:
+    def extract_audio(self, output_format: str = "wav") -> Optional[AudioSegment]:
         """
-        Extract audio from video file using ffmpeg.
+        Extract audio from video file using ffmpeg and save to temp file.
         
         Args:
-            output_format: Audio format (mp3, wav, aac, etc.)
+            output_format: Audio format (wav, mp3, etc.)
             
         Returns:
             AudioSegment object or None if extraction fails
         """
-        if AudioSegment is None:
-            print("Warning: pydub not installed. Audio will not be available.")
-            print("Install with: pip install pydub")
-            return None
-        
+        # Check if ffmpeg is available
         try:
-            # Check if ffmpeg is available
             result = subprocess.run(['ffmpeg', '-version'], 
-                                  capture_output=True, timeout=5)
+                                  capture_output=True, timeout=5, 
+                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
             if result.returncode != 0:
                 print("Warning: ffmpeg not found. Cannot extract audio.")
                 return None
@@ -73,21 +70,71 @@ class AudioProcessor:
             print("Install ffmpeg:")
             print("  macOS: brew install ffmpeg")
             print("  Linux: sudo apt install ffmpeg")
-            print("  Windows: https://ffmpeg.org/download.html")
+            print("  Windows: choco install ffmpeg")
             return None
         
         try:
-            # Try to load audio directly using pydub
             print(f"Extracting audio from {self.video_path}...")
             
-            # Determine audio codec based on input file
-            audio = AudioSegment.from_file(self.video_path)
+            # Create temporary file for audio
+            self._temp_audio_file = tempfile.NamedTemporaryFile(
+                suffix=f'.{output_format}', delete=False
+            )
+            self.audio_file_path = self._temp_audio_file.name
+            self._temp_audio_file.close()
             
-            self.audio_data = audio
-            self.audio_duration = len(audio) / 1000.0  # Convert ms to seconds
+            # Extract audio using ffmpeg directly
+            cmd = [
+                'ffmpeg',
+                '-i', self.video_path,
+                '-vn',  # No video
+                '-acodec', 'pcm_s16le' if output_format == 'wav' else 'libmp3lame',
+                '-ar', '44100',  # Sample rate
+                '-ac', '2',  # Stereo
+                '-y',  # Overwrite
+                self.audio_file_path
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=60,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            
+            if result.returncode != 0:
+                print(f"Warning: Could not extract audio: {result.stderr.decode()}")
+                return None
+            
+            # Get duration using ffprobe
+            try:
+                cmd_probe = [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    self.audio_file_path
+                ]
+                result = subprocess.run(
+                    cmd_probe,
+                    capture_output=True,
+                    timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                self.audio_duration = float(result.stdout.decode().strip())
+            except:
+                self.audio_duration = 0
             
             print(f"Audio extracted: {self.audio_duration:.2f} seconds")
-            return audio
+            
+            # Load with pydub if available for metadata
+            if AudioSegment:
+                try:
+                    self.audio_data = AudioSegment.from_file(self.audio_file_path)
+                except:
+                    pass
+            
+            return self.audio_data
             
         except Exception as e:
             print(f"Warning: Could not extract audio: {e}")
@@ -100,23 +147,18 @@ class AudioProcessor:
         Returns:
             Duration in seconds
         """
-        if self.audio_data is None:
-            return 0
-        return len(self.audio_data) / 1000.0
+        return self.audio_duration
     
     def play_async(self, delay: float = 0, volume: float = 1.0) -> None:
         """
-        Start playing audio asynchronously in a separate thread.
+        Start playing audio asynchronously using system player.
         
         Args:
             delay: Delay before starting playback (seconds)
-            volume: Volume level (0.0 to 1.0)
+            volume: Volume level (0.0 to 1.0) - not implemented for all players
         """
-        if self.audio_data is None:
-            return
-        
-        if play is None:
-            print("Warning: pydub playback not available")
+        if not self.audio_file_path or not os.path.exists(self.audio_file_path):
+            print("Warning: No audio file to play")
             return
         
         # Stop any existing playback
@@ -125,21 +167,70 @@ class AudioProcessor:
         def playback_thread():
             try:
                 self.is_playing = True
-                self.playback_start_time = time.time() - (delay / 1000.0)
-                
-                # Apply volume adjustment
-                audio = self.audio_data
-                if volume < 1.0:
-                    audio = audio + (20 * (volume - 1))  # dB adjustment
-                elif volume > 1.0:
-                    audio = audio + (20 * (volume - 1))
+                self.playback_start_time = time.time()
                 
                 # Wait for delay if specified
                 if delay > 0:
                     time.sleep(delay)
                 
-                # Play audio
-                play(audio)
+                # Platform-specific audio playback
+                if sys.platform == 'win32':
+                    # Windows: Try ffplay first, then fallback to PowerShell
+                    try:
+                        # Try ffplay (comes with ffmpeg)
+                        self.playback_process = subprocess.Popen(
+                            ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', 
+                             self.audio_file_path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                        self.playback_process.wait()
+                    except FileNotFoundError:
+                        # Fallback to PowerShell Windows Media Player
+                        ps_command = f'''Add-Type -AssemblyName presentationCore; 
+                        $mediaPlayer = New-Object system.windows.media.mediaplayer; 
+                        $mediaPlayer.open(\"{self.audio_file_path}\"); 
+                        $mediaPlayer.Play(); 
+                        Start-Sleep -Seconds {int(self.audio_duration) + 1}'''
+                        
+                        self.playback_process = subprocess.Popen(
+                            ['powershell', '-Command', ps_command],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW
+                        )
+                        self.playback_process.wait()
+                
+                elif sys.platform == 'darwin':
+                    # macOS: Use afplay
+                    self.playback_process = subprocess.Popen(
+                        ['afplay', self.audio_file_path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    self.playback_process.wait()
+                
+                else:
+                    # Linux: Try multiple players
+                    players = ['ffplay', 'aplay', 'paplay', 'mpg123']
+                    for player in players:
+                        try:
+                            cmd = [player]
+                            if player == 'ffplay':
+                                cmd.extend(['-nodisp', '-autoexit', '-loglevel', 'quiet'])
+                            cmd.append(self.audio_file_path)
+                            
+                            self.playback_process = subprocess.Popen(
+                                cmd,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL
+                            )
+                            self.playback_process.wait()
+                            break
+                        except FileNotFoundError:
+                            continue
+                
                 self.is_playing = False
                 
             except Exception as e:
@@ -155,9 +246,16 @@ class AudioProcessor:
         Stop audio playback.
         """
         self.is_playing = False
-        if self.play_thread and self.play_thread.is_alive():
-            # Note: Cannot forcefully stop pydub playback, but flag is set
-            pass
+        if self.playback_process:
+            try:
+                self.playback_process.terminate()
+                self.playback_process.wait(timeout=1)
+            except:
+                try:
+                    self.playback_process.kill()
+                except:
+                    pass
+            self.playback_process = None
     
     def get_current_playback_time(self) -> float:
         """
@@ -178,13 +276,21 @@ class AudioProcessor:
         Returns:
             True if audio can be played
         """
-        return self.audio_data is not None and play is not None
+        return self.audio_file_path is not None and os.path.exists(self.audio_file_path)
     
     def cleanup(self) -> None:
         """
         Clean up resources.
         """
         self.stop()
+        
+        # Clean up temporary audio file
+        if self.audio_file_path and os.path.exists(self.audio_file_path):
+            try:
+                os.unlink(self.audio_file_path)
+            except:
+                pass
+        
         self.audio_data = None
 
 
