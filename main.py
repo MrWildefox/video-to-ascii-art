@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Video to ASCII Art Converter
+Video to ASCII Art Converter with Audio Support
 Main entry point for the application.
 
 Usage:
     python main.py -f video.mp4 -w 120
-    python main.py -f video.mp4 -w 100 --color --speed 1.5
+    python main.py -f video.mp4 -w 100 --audio --color
+    python main.py -f video.mp4 -w 100 --speed 1.5 --audio
 """
 
 import argparse
@@ -25,6 +26,8 @@ except ImportError:
 
 from ascii_converter import ASCIIConverter
 from video_processor import VideoProcessor
+from audio_processor import AudioProcessor, AudioSynchronizer
+from color_processor import ColorProcessor
 from ascii_charsets import list_charsets
 from config import (
     DEFAULT_WIDTH, ENABLE_COLOR, DEFAULT_SPEED,
@@ -34,12 +37,12 @@ from config import (
 
 class ASCIIVideoPlayer:
     """
-    Main video player that converts and displays video as ASCII art.
+    Main video player that converts and displays video as ASCII art with optional audio.
     """
     
     def __init__(self, video_path: str, width: int = DEFAULT_WIDTH,
                  charset: str = DEFAULT_CHARSET, color: bool = ENABLE_COLOR,
-                 speed: float = DEFAULT_SPEED, skip: int = 0):
+                 speed: float = DEFAULT_SPEED, skip: int = 0, audio: bool = False):
         """
         Initialize the ASCII video player.
         
@@ -50,6 +53,7 @@ class ASCIIVideoPlayer:
             color: Enable color output
             speed: Playback speed multiplier
             skip: Skip frames
+            audio: Enable audio playback
         """
         self.video_path = video_path
         self.width = width
@@ -57,10 +61,24 @@ class ASCIIVideoPlayer:
         self.color = color
         self.speed = speed
         self.skip = skip
+        self.audio_enabled = audio
         
         try:
             self.processor = VideoProcessor(video_path)
             self.converter = ASCIIConverter(width, charset)
+            self.color_processor = ColorProcessor(use_truecolor=True) if color else None
+            
+            # Initialize audio if enabled
+            self.audio_processor = None
+            if audio:
+                self.audio_processor = AudioProcessor(video_path)
+                self.audio_processor.extract_audio()
+            
+            self.synchronizer = AudioSynchronizer(
+                self.processor.fps, 
+                self.audio_processor
+            )
+            
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -80,20 +98,23 @@ class ASCIIVideoPlayer:
     
     def play(self) -> None:
         """
-        Play the video as ASCII art.
+        Play the video as ASCII art with optional audio.
         """
-        print(f"\n=== ASCII Video Player ===")
+        print(f"\n=== ASCII Video Player with Audio ===")
         print(f"Video: {self.video_path}")
         print(f"Dimensions: {self.processor.width}x{self.processor.height}")
         print(f"FPS: {self.processor.fps:.2f}")
         print(f"Total Frames: {self.processor.frame_count}")
         print(f"Output Width: {self.width} characters")
         print(f"Charset: {self.charset}")
+        print(f"Color: {'Enabled' if self.color else 'Disabled'}")
+        print(f"Audio: {'Enabled' if self.audio_enabled else 'Disabled'}")
         print(f"Speed: {self.speed}x")
         print(f"\nStarting playback... Press Ctrl+C to stop.\n")
         time.sleep(2)
         
-        frame_delay = (1.0 / self.processor.fps) / self.speed if self.processor.fps > 0 else 0.033
+        # Start synchronization and audio
+        self.synchronizer.start(play_audio=self.audio_enabled)
         
         try:
             frame_num = 0
@@ -104,24 +125,34 @@ class ASCIIVideoPlayer:
                 start_time = time.time()
                 
                 # Convert frame to ASCII
-                frame_ascii = self.converter.frame_to_ascii(frame)
+                if self.color and self.color_processor:
+                    # Get ASCII array for colorization
+                    ascii_array = self.converter.get_ascii_array(frame)
+                    frame_ascii = self.color_processor.colorize_frame(frame, ascii_array)
+                else:
+                    frame_ascii = self.converter.frame_to_ascii(frame)
                 
                 # Print frame
                 self.print_frame(frame_ascii)
                 
                 # Show playback info
+                audio_time = ""
+                if self.audio_processor and self.audio_processor.is_playing:
+                    audio_time = f" | Audio: {self.synchronizer.get_audio_duration():.1f}s"
+                
                 if SHOW_PROGRESS and total_frames > 0:
                     progress = (frame_count / total_frames) * 100
-                    print(f"\n[{'='*30}] {progress:.1f}% - Frame {frame_count}/{total_frames}", 
+                    print(f"\n[{'='*30}] {progress:.1f}% - Frame {frame_count}/{total_frames}{audio_time}", 
                           end='', flush=True)
                 else:
-                    print(f"\nFrame: {frame_count}", end='', flush=True)
+                    print(f"\nFrame: {frame_count}{audio_time}", end='', flush=True)
                 
-                # Frame rate control
-                elapsed = time.time() - start_time
-                sleep_time = max(0, frame_delay - elapsed)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # Synchronize with audio (if playing) or maintain frame rate
+                processing_time = time.time() - start_time
+                self.synchronizer.wait_for_frame(
+                    speed_multiplier=self.speed,
+                    processing_time=processing_time
+                )
                 
                 frame_count += 1
             
@@ -129,7 +160,7 @@ class ASCIIVideoPlayer:
             os.system('cls' if os.name == 'nt' else 'clear')
             print(f"\n=== Playback Complete ===")
             print(f"Total frames played: {frame_count}")
-            print(f"Frames per second: {frame_count / self.processor.fps:.2f}")
+            print(f"Average FPS: {frame_count / (self.processor.fps / self.speed) if self.processor.fps > 0 else 0:.2f}")
             print("\nPress any key to exit...")
             
         except KeyboardInterrupt:
@@ -139,20 +170,28 @@ class ASCIIVideoPlayer:
         
         finally:
             self.processor.close()
+            if self.audio_processor:
+                self.audio_processor.cleanup()
     
-    def export_frames(self, output_dir: str = "output_frames/") -> None:
+    def export_frames(self, output_dir: str = "output_frames/", include_color: bool = False) -> None:
         """
         Export all frames as text files.
         
         Args:
             output_dir: Directory to save frames
+            include_color: Include ANSI color codes in output
         """
         Path(output_dir).mkdir(exist_ok=True)
         
         print(f"Exporting frames to {output_dir}...")
         
         for frame_num, frame in self.processor.get_frames(skip=self.skip):
-            frame_ascii = self.converter.frame_to_ascii(frame)
+            # Convert frame to ASCII
+            if include_color and self.color_processor:
+                ascii_array = self.converter.get_ascii_array(frame)
+                frame_ascii = self.color_processor.colorize_frame(frame, ascii_array)
+            else:
+                frame_ascii = self.converter.frame_to_ascii(frame)
             
             # Save frame
             filename = f"{output_dir}frame_{frame_num:06d}.txt"
@@ -171,13 +210,13 @@ def main():
     Main entry point.
     """
     parser = argparse.ArgumentParser(
-        description="Convert videos to ASCII art and play in terminal",
+        description="Convert videos to ASCII art with optional audio synchronization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s -f video.mp4
-  %(prog)s -f video.mp4 -w 100 --color
-  %(prog)s -f video.mp4 -w 80 -c simple --speed 2.0
+  %(prog)s -f video.mp4 -w 100 --audio --color
+  %(prog)s -f video.mp4 -w 80 -c simple --speed 2.0 --audio
   %(prog)s -f 0 -w 80  # Webcam input
         """
     )
@@ -192,6 +231,9 @@ Examples:
                         choices=list_charsets(),
                         help=f'Character set to use (default: {DEFAULT_CHARSET})')
     
+    parser.add_argument('--audio', dest='audio', action='store_true',
+                        help='Enable audio playback (requires ffmpeg and pydub)')
+    
     parser.add_argument('--color', dest='color', action='store_true',
                         help='Enable color output')
     
@@ -203,6 +245,9 @@ Examples:
     
     parser.add_argument('--export', dest='export', type=str, default=None,
                         help='Export frames to directory instead of playing')
+    
+    parser.add_argument('--export-color', dest='export_color', action='store_true',
+                        help='Include ANSI color codes when exporting frames')
     
     args = parser.parse_args()
     
@@ -218,6 +263,26 @@ Examples:
         print("Error: Speed must be positive", file=sys.stderr)
         sys.exit(1)
     
+    # Check for audio dependencies if requested
+    if args.audio:
+        try:
+            from pydub import AudioSegment
+        except ImportError:
+            print("Error: pydub not installed. Required for audio playback.")
+            print("Install with: pip install pydub")
+            sys.exit(1)
+        
+        try:
+            import subprocess
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            print("Warning: ffmpeg not found. Audio extraction will not work.")
+            print("Install ffmpeg:")
+            print("  macOS: brew install ffmpeg")
+            print("  Linux: sudo apt install ffmpeg")
+            print("  Windows: https://ffmpeg.org/download.html")
+            args.audio = False
+    
     # Create and run player
     player = ASCIIVideoPlayer(
         video_path=args.video_file,
@@ -225,11 +290,12 @@ Examples:
         charset=args.charset,
         color=args.color,
         speed=args.speed,
-        skip=args.skip
+        skip=args.skip,
+        audio=args.audio
     )
     
     if args.export:
-        player.export_frames(args.export)
+        player.export_frames(args.export, include_color=args.export_color)
     else:
         player.play()
 
